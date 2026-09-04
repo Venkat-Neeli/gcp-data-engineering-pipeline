@@ -1,4 +1,7 @@
 # GCP Data Engineering Pipeline
+> **Project Status:** Portfolio-ready implementation  
+> **Primary Focus:** GCS → Airflow → BigQuery ETL  
+> **Data:** Fictional sample customer data
 
 An end-to-end data engineering pipeline demonstrating how to ingest customer data from Google Cloud Storage, orchestrate processing with Apache Airflow, and load and maintain analytical data in Google BigQuery.
 
