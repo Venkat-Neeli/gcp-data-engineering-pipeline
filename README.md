@@ -211,9 +211,30 @@ The SQL demonstrates:
 
 ## Configuration
 
-Environment-specific configuration is intentionally not hard-coded.
+The pipeline keeps environment-specific configuration outside the DAG code.
 
-The DAG expects the following Airflow Variables:
+### Airflow Connection
+
+Configure a Google Cloud connection in Airflow:
+
+```text
+Connection ID: google_cloud_default
+Connection Type: Google Cloud
+```
+
+The connection should provide the credentials required for Airflow to access GCS and BigQuery.
+
+### Airflow Variables
+
+Create the following Airflow Variables:
+
+| Variable | Example Value | Purpose |
+|---|---|---|
+| `gcp_project_id` | `my-gcp-project` | Google Cloud project ID |
+| `bq_dataset_id` | `analytics` | BigQuery dataset |
+| `gcs_bucket` | `my-data-bucket` | GCS bucket containing source files |
+
+The DAG references these variables at runtime:
 
 ```text
 gcp_project_id
@@ -221,20 +242,12 @@ bq_dataset_id
 gcs_bucket
 ```
 
-The DAG uses the Airflow Google Cloud connection:
+### GCS Input Location
+
+Place the source CSV file under:
 
 ```text
-google_cloud_default
-```
-
-This approach keeps environment-specific configuration outside the source code.
-
-## GCS Structure
-
-The pipeline expects incoming files under:
-
-```text
-gs://<bucket-name>/incoming/
+gs://<gcs_bucket>/incoming/
 ```
 
 Example:
@@ -243,7 +256,21 @@ Example:
 gs://my-data-bucket/incoming/customers.csv
 ```
 
-The bucket name is supplied through an Airflow Variable rather than being hard-coded.
+The DAG automatically searches the `incoming/` prefix and selects the most recently updated customer CSV file.
+
+### BigQuery Dataset
+
+Create the target dataset before running the DAG.
+
+The repository contains the target table schema in:
+
+```text
+sql/customers_schema.sql
+```
+
+Replace the placeholder project and dataset values in that SQL template with your own GCP environment.
+
+> **Security:** Never commit service-account keys, passwords, access tokens, or other credentials to the repository.
 
 ## Data Engineering Concepts Demonstrated
 
