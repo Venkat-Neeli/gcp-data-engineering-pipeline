@@ -1,24 +1,19 @@
 """
-GCS to BigQuery ETL Pipeline
-----------------------------
+GCS to BigQuery Customer Pipeline
 
-Portfolio implementation demonstrating:
+Demonstrates an Airflow ETL pipeline that:
 
-1. Discovering the latest CSV file in GCS
-2. Dynamically identifying the target table
-3. Loading data into a BigQuery staging table
-4. Deduplicating records
-5. Upserting records into the target table
-6. Cleaning up the staging table
+1. Finds the latest customer CSV in GCS
+2. Loads the file into a BigQuery staging table
+3. Deduplicates customer records
+4. Upserts records into the target table
+5. Removes temporary staging tables
 
-This implementation uses Airflow Variables for environment-specific
-configuration so that credentials and project-specific information
-are not hard-coded.
+All environment-specific values are supplied through
+Airflow Variables.
 """
 
 from datetime import datetime, timedelta
-import json
-import re
 
 from airflow import DAG
 from airflow.models import Variable
@@ -40,6 +35,9 @@ BQ_DATASET_ID = "{{ var.value.bq_dataset_id }}"
 GCS_BUCKET = "{{ var.value.gcs_bucket }}"
 
 GCS_PREFIX = "incoming/"
+TABLE_NAME = "customers"
+STAGING_TABLE = "customers_staging"
+DEDUP_TABLE = "customers_deduplicated"
 
 
 default_args = {
@@ -50,41 +48,13 @@ default_args = {
 
 
 # =========================================================
-# Table key configuration
+# Discover latest customer file
 # =========================================================
 
-KEY_COLUMNS_RAW = Variable.get(
-    "table_key_columns",
-    default_var="{}",
-)
-
-try:
-    TABLE_KEY_COLUMNS = json.loads(KEY_COLUMNS_RAW)
-except json.JSONDecodeError:
-    TABLE_KEY_COLUMNS = {}
-
-
-DEFAULT_KEY_COLUMN = Variable.get(
-    "default_key_column",
-    default_var="customer_id",
-)
-
-
-# =========================================================
-# Discover latest source file
-# =========================================================
-
-def get_latest_file_and_table_name(**kwargs):
+def get_latest_customer_file(**kwargs):
     """
-    Identify the latest CSV file available in GCS.
-
-    The function determines:
-
-    - Source GCS URI
-    - Target BigQuery table
-    - Key column used for upsert
-
-    Values are passed to downstream tasks using XCom.
+    Find the most recently updated customer CSV in GCS
+    and pass its URI to downstream tasks through XCom.
     """
 
     ti = kwargs["ti"]
@@ -108,11 +78,12 @@ def get_latest_file_and_table_name(**kwargs):
         object_name
         for object_name in object_names
         if object_name.lower().endswith(".csv")
+        and "customer" in object_name.lower()
     ]
 
     if not csv_objects:
         raise ValueError(
-            f"No CSV files found in "
+            f"No customer CSV files found in "
             f"gs://{GCS_BUCKET}/{GCS_PREFIX}"
         )
 
@@ -138,68 +109,20 @@ def get_latest_file_and_table_name(**kwargs):
 
     if latest_blob is None:
         raise ValueError(
-            "Unable to determine the latest CSV file."
+            "Unable to determine the latest customer file."
         )
-
-    file_name = (
-        latest_blob.name
-        .split("/")[-1]
-    )
-
-    base_name = file_name.rsplit(
-        ".",
-        1,
-    )[0]
-
-    # Remove numeric suffixes such as _01 or _100.
-    clean_base_name = re.sub(
-        r"_[0-9]+$",
-        "",
-        base_name,
-    )
-
-    table_name = (
-        clean_base_name
-        .lower()
-        .replace("-", "_")
-        .replace(" ", "_")
-    )
-
-    key_column = TABLE_KEY_COLUMNS.get(
-        table_name,
-        DEFAULT_KEY_COLUMN,
-    )
 
     source_uri = (
         f"gs://{GCS_BUCKET}/{latest_blob.name}"
     )
 
-    # Store values for downstream tasks.
     ti.xcom_push(
         key="source_uri",
         value=source_uri,
     )
 
-    ti.xcom_push(
-        key="table_name",
-        value=table_name,
-    )
-
-    ti.xcom_push(
-        key="key_column",
-        value=key_column,
-    )
-
     print(
-        f"Latest file: {latest_blob.name}"
-    )
-
-    print(
-        f"Target table: {table_name}"
-    )
-
-    print(
-        f"Key column: {key_column}"
+        f"Selected source file: {source_uri}"
     )
 
 
@@ -208,10 +131,10 @@ def get_latest_file_and_table_name(**kwargs):
 # =========================================================
 
 with DAG(
-    dag_id="gcs_to_bigquery",
+    dag_id="gcs_to_bigquery_customers",
     description=(
-        "GCS to BigQuery ETL pipeline "
-        "with staging and upsert processing."
+        "Load customer data from GCS into BigQuery "
+        "using staging, deduplication and MERGE."
     ),
     start_date=datetime(
         2026,
@@ -225,23 +148,22 @@ with DAG(
         "gcp",
         "gcs",
         "bigquery",
+        "airflow",
         "etl",
     ],
 ) as dag:
 
     # -----------------------------------------------------
-    # 1. Discover latest source file
+    # 1. Find latest source file
     # -----------------------------------------------------
 
     get_file_info = PythonOperator(
         task_id="get_file_info",
-        python_callable=(
-            get_latest_file_and_table_name
-        ),
+        python_callable=get_latest_customer_file,
     )
 
     # -----------------------------------------------------
-    # 2. Load source file into staging table
+    # 2. Load GCS file into staging table
     # -----------------------------------------------------
 
     load_to_staging = BigQueryInsertJobOperator(
@@ -257,59 +179,46 @@ with DAG(
                 "destinationTable": {
                     "projectId": GCP_PROJECT_ID,
                     "datasetId": BQ_DATASET_ID,
-                    "tableId": (
-                        "{{ ti.xcom_pull("
-                        "task_ids='get_file_info', "
-                        "key='table_name'"
-                        ") }}_staging"
-                    ),
+                    "tableId": STAGING_TABLE,
                 },
                 "sourceFormat": "CSV",
                 "autodetect": True,
                 "skipLeadingRows": 1,
-                "writeDisposition": (
-                    "WRITE_TRUNCATE"
-                ),
+                "writeDisposition": "WRITE_TRUNCATE",
             }
         },
         gcp_conn_id=GCP_CONN_ID,
     )
 
     # -----------------------------------------------------
-    # 3. Remove duplicate records
+    # 3. Deduplicate staging data
     # -----------------------------------------------------
 
     deduplicate_staging = BigQueryInsertJobOperator(
         task_id="deduplicate_staging",
         configuration={
             "query": {
-                "query": """
+                "query": f"""
                     CREATE OR REPLACE TABLE
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}_deduplicated`
-                    AS
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {DEDUP_TABLE}` AS
 
-                    SELECT *
+                    SELECT
+                        customer_id,
+                        customer_name,
+                        email,
+                        city,
+                        updated_at
+
                     FROM
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}_staging`
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {STAGING_TABLE}`
 
                     QUALIFY ROW_NUMBER() OVER (
-                        PARTITION BY
-                            {{ ti.xcom_pull(
-                                task_ids='get_file_info',
-                                key='key_column'
-                            ) }}
-                        ORDER BY
-                            1
+                        PARTITION BY customer_id
+                        ORDER BY updated_at DESC
                     ) = 1
                 """,
                 "useLegacySql": False,
@@ -319,42 +228,53 @@ with DAG(
     )
 
     # -----------------------------------------------------
-    # 4. Upsert records into target table
+    # 4. Upsert into target table
     # -----------------------------------------------------
 
     upsert_to_target = BigQueryInsertJobOperator(
         task_id="upsert_to_target",
         configuration={
             "query": {
-                "query": """
+                "query": f"""
                     MERGE INTO
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}` AS target
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {TABLE_NAME}` AS target
 
                     USING
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}_deduplicated` AS source
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {DEDUP_TABLE}` AS source
 
-                    ON target.{{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='key_column'
-                    ) }}
-                    =
-                    source.{{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='key_column'
-                    ) }}
+                    ON target.customer_id =
+                       source.customer_id
+
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            customer_name =
+                                source.customer_name,
+                            email =
+                                source.email,
+                            city =
+                                source.city,
+                            updated_at =
+                                source.updated_at
 
                     WHEN NOT MATCHED THEN
-                        INSERT ROW
+                        INSERT (
+                            customer_id,
+                            customer_name,
+                            email,
+                            city,
+                            updated_at
+                        )
+                        VALUES (
+                            source.customer_id,
+                            source.customer_name,
+                            source.email,
+                            source.city,
+                            source.updated_at
+                        )
                 """,
                 "useLegacySql": False,
             }
@@ -363,29 +283,23 @@ with DAG(
     )
 
     # -----------------------------------------------------
-    # 5. Remove temporary tables
+    # 5. Cleanup temporary tables
     # -----------------------------------------------------
 
     cleanup_staging = BigQueryInsertJobOperator(
         task_id="cleanup_staging",
         configuration={
             "query": {
-                "query": """
+                "query": f"""
                     DROP TABLE IF EXISTS
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}_staging`;
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {STAGING_TABLE}`;
 
                     DROP TABLE IF EXISTS
-                    `{{ var.value.gcp_project_id }}.
-                    {{ var.value.bq_dataset_id }}.
-                    {{ ti.xcom_pull(
-                        task_ids='get_file_info',
-                        key='table_name'
-                    ) }}_deduplicated`;
+                    `{{{{ var.value.gcp_project_id }}}}.
+                    {{{{ var.value.bq_dataset_id }}}}.
+                    {DEDUP_TABLE}`;
                 """,
                 "useLegacySql": False,
             }
