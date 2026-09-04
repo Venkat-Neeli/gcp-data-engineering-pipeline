@@ -1,1 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
 
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Google Cloud credentials
+*.json
+!sample_data.json
+
+# Airflow
+airflow.cfg
+airflow.db
+logs/
+
+# Data files
+*.csv
+*.parquet
+*.avro
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
