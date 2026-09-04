@@ -66,7 +66,7 @@ except json.JSONDecodeError:
 
 DEFAULT_KEY_COLUMN = Variable.get(
     "default_key_column",
-    default_var="id",
+    default_var="customer_id",
 )
 
 
